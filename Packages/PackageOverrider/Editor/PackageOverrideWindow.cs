@@ -20,8 +20,10 @@ namespace PackageOverrider
         private Vector2 _scrollPosition;
         private string _filterText = "";
         private PackageOverrideData _data;
-        private Dictionary<string, string> _currentDependencies;
         private bool _hasUnsavedChanges;
+
+        private readonly List<(UnityEditor.PackageManager.Requests.Request request, Action<UnityEditor.PackageManager.Requests.Request> onComplete)> _pendingRequests = new List<(UnityEditor.PackageManager.Requests.Request, Action<UnityEditor.PackageManager.Requests.Request>)>();
+        private Dictionary<string, UnityEditor.PackageManager.PackageInfo> _packageInfoCache = new Dictionary<string, UnityEditor.PackageManager.PackageInfo>();
 
         [MenuItem("Window/Package Management/Package Overrider", false, 2100)]
         public static void ShowWindow()
@@ -33,12 +35,18 @@ namespace PackageOverrider
         private void OnEnable()
         {
             LoadSettings();
-            LoadManifest();
+            LoadPackageList();
+            EditorApplication.update += UpdatePendingRequests;
+        }
+
+        private void OnDisable()
+        {
+            EditorApplication.update -= UpdatePendingRequests;
         }
 
         private void OnFocus()
         {
-            LoadManifest();
+            LoadPackageList();
             Repaint();
         }
 
@@ -55,7 +63,7 @@ namespace PackageOverrider
 
             if (GUILayout.Button("Refresh", EditorStyles.toolbarButton, GUILayout.Width(60)))
             {
-                LoadManifest();
+                LoadPackageList();
             }
 
             GUILayout.FlexibleSpace();
@@ -68,95 +76,241 @@ namespace PackageOverrider
 
         private void DrawPackageList()
         {
-            if (_currentDependencies == null)
+            if (_packageInfoCache == null || _packageInfoCache.Count == 0)
             {
-                EditorGUILayout.HelpBox("manifest.json を読み込めませんでした。", MessageType.Error);
+                EditorGUILayout.HelpBox("パッケージ情報を読み込めませんでした。", MessageType.Error);
                 return;
             }
 
             _scrollPosition = EditorGUILayout.BeginScrollView(_scrollPosition);
 
-            var filteredDependencies = _currentDependencies
-                .Where(kvp => !kvp.Key.StartsWith("com.unity.modules."))
-                .Where(kvp => string.IsNullOrEmpty(_filterText) ||
-                              kvp.Key.IndexOf(_filterText, StringComparison.OrdinalIgnoreCase) >= 0)
-                .OrderBy(kvp => kvp.Key);
+            var filteredPackages = _packageInfoCache.Values
+                .Where(pkg => !pkg.name.StartsWith("com.unity.modules."))
+                .Where(pkg => string.IsNullOrEmpty(_filterText) ||
+                              pkg.name.IndexOf(_filterText, StringComparison.OrdinalIgnoreCase) >= 0)
+                .OrderBy(pkg => pkg.name);
 
-            foreach (var kvp in filteredDependencies)
+            foreach (var packageInfo in filteredPackages)
             {
-                DrawPackageEntry(kvp.Key, kvp.Value);
+                DrawPackageEntry(packageInfo);
             }
 
             EditorGUILayout.EndScrollView();
         }
 
-        private void DrawPackageEntry(string packageName, string currentSource)
+        private void DrawPackageEntry(UnityEditor.PackageManager.PackageInfo packageInfo)
         {
-            var entry = GetOrCreateEntry(packageName);
-            bool wasOverridden = entry.isOverridden;
+            var entry = GetOrCreateEntry(packageInfo.name);
+            var state = GetPackageState(entry);
+
+            string currentSource = GetPackageSourceString(packageInfo);
+            if (string.IsNullOrEmpty(entry.originalSource))
+            {
+                entry.originalSource = currentSource;
+            }
 
             EditorGUILayout.BeginVertical(EditorStyles.helpBox);
 
-            EditorGUILayout.BeginHorizontal();
-            entry.isOverridden = EditorGUILayout.ToggleLeft(packageName, entry.isOverridden, EditorStyles.boldLabel);
-            EditorGUILayout.EndHorizontal();
-
+            DrawPackageHeader(packageInfo.name, state);
             EditorGUI.indentLevel++;
+            DrawPackageInfo(entry, currentSource, state);
+            DrawPackageActions(entry, state);
+            EditorGUI.indentLevel--;
 
-            if (entry.isOverridden)
+            EditorGUILayout.EndVertical();
+        }
+
+        private string GetPackageSourceString(UnityEditor.PackageManager.PackageInfo packageInfo)
+        {
+            switch (packageInfo.source)
             {
-                if (!wasOverridden && string.IsNullOrEmpty(entry.originalSource))
-                {
-                    entry.originalSource = currentSource;
-                    _hasUnsavedChanges = true;
-                }
-
-                EditorGUILayout.LabelField("Original:", entry.originalSource, EditorStyles.miniLabel);
-
-                EditorGUILayout.BeginHorizontal();
-                EditorGUILayout.LabelField("Override:", GUILayout.Width(60));
-                string newPath = EditorGUILayout.TextField(entry.overridePath);
-                if (newPath != entry.overridePath)
-                {
-                    entry.overridePath = newPath;
-                    _hasUnsavedChanges = true;
-                }
-
-                if (GUILayout.Button("...", GUILayout.Width(30)))
-                {
-                    string selectedPath = EditorUtility.OpenFolderPanel(
-                        "Select Package Folder",
-                        string.IsNullOrEmpty(entry.overridePath) ? "" : entry.overridePath,
-                        "");
-
-                    if (!string.IsNullOrEmpty(selectedPath))
-                    {
-                        entry.overridePath = selectedPath;
-                        _hasUnsavedChanges = true;
-                    }
-                }
-                EditorGUILayout.EndHorizontal();
-
-                if (!string.IsNullOrEmpty(entry.overridePath))
-                {
-                    string packageJsonPath = Path.Combine(entry.overridePath, "package.json");
-                    if (!File.Exists(packageJsonPath))
-                    {
-                        EditorGUILayout.HelpBox("指定されたパスに package.json が見つかりません。", MessageType.Warning);
-                    }
-                }
+                case UnityEditor.PackageManager.PackageSource.Registry:
+                case UnityEditor.PackageManager.PackageSource.BuiltIn:
+                    return packageInfo.version;
+                case UnityEditor.PackageManager.PackageSource.Embedded:
+                    return $"Embedded: {packageInfo.resolvedPath}";
+                case UnityEditor.PackageManager.PackageSource.Local:
+                    return $"file:{packageInfo.resolvedPath}";
+                case UnityEditor.PackageManager.PackageSource.Git:
+                    return packageInfo.packageId.Split('@').Length > 1 ? packageInfo.packageId.Split('@')[1] : packageInfo.packageId;
+                default:
+                    return packageInfo.version;
             }
-            else
+        }
+
+        private void DrawPackageHeader(string packageName, PackageState state)
+        {
+            string displayName = packageName;
+
+            switch (state)
             {
-                if (wasOverridden)
-                {
-                    _hasUnsavedChanges = true;
-                }
+                case PackageState.EmbeddedActive:
+                    displayName += " (Embedded)";
+                    break;
+                case PackageState.EmbeddedDisabled:
+                    displayName += " (Embedded - Disabled)";
+                    break;
+                case PackageState.OverrideActive:
+                    displayName += " (Override)";
+                    break;
+            }
+
+            EditorGUILayout.LabelField(displayName, EditorStyles.boldLabel);
+        }
+
+        private void DrawPackageInfo(PackageOverrideEntry entry, string currentSource, PackageState state)
+        {
+            if (!string.IsNullOrEmpty(entry.originalSource))
+            {
+                EditorGUILayout.LabelField("Original:", entry.originalSource, EditorStyles.miniLabel);
+            }
+            else if (state == PackageState.PackageCache)
+            {
                 EditorGUILayout.LabelField("Current:", currentSource, EditorStyles.miniLabel);
             }
 
-            EditorGUI.indentLevel--;
-            EditorGUILayout.EndVertical();
+            switch (state)
+            {
+                case PackageState.OverrideActive:
+                    EditorGUILayout.BeginHorizontal();
+                    EditorGUILayout.LabelField("Path:", GUILayout.Width(40));
+                    string newPath = EditorGUILayout.TextField(entry.overridePath);
+                    if (newPath != entry.overridePath)
+                    {
+                        entry.overridePath = newPath;
+                        _hasUnsavedChanges = true;
+                    }
+
+                    if (GUILayout.Button("...", GUILayout.Width(30)))
+                    {
+                        string selectedPath = EditorUtility.OpenFolderPanel(
+                            "Select Package Folder",
+                            string.IsNullOrEmpty(entry.overridePath) ? "" : entry.overridePath,
+                            "");
+
+                        if (!string.IsNullOrEmpty(selectedPath))
+                        {
+                            entry.overridePath = selectedPath;
+                            _hasUnsavedChanges = true;
+                        }
+                    }
+                    EditorGUILayout.EndHorizontal();
+
+                    if (!string.IsNullOrEmpty(entry.overridePath))
+                    {
+                        string packageJsonPath = Path.Combine(entry.overridePath, "package.json");
+                        if (!File.Exists(packageJsonPath))
+                        {
+                            EditorGUILayout.HelpBox("指定されたパスに package.json が見つかりません。", MessageType.Warning);
+                        }
+                    }
+                    break;
+
+                case PackageState.EmbeddedActive:
+                case PackageState.EmbeddedDisabled:
+                    string embeddedPath = $"Packages/{entry.packageName}";
+                    string statusText = state == PackageState.EmbeddedActive ? "" : " (package.json.disabled)";
+                    EditorGUILayout.LabelField("Location:", embeddedPath + statusText, EditorStyles.miniLabel);
+                    break;
+            }
+        }
+
+        private void DrawPackageActions(PackageOverrideEntry entry, PackageState state)
+        {
+            switch (state)
+            {
+                case PackageState.PackageCache:
+                    DrawPackageCacheActions(entry);
+                    break;
+                case PackageState.OverrideActive:
+                    DrawOverrideActiveActions(entry);
+                    break;
+                case PackageState.EmbeddedActive:
+                    DrawEmbeddedActiveActions(entry);
+                    break;
+                case PackageState.EmbeddedDisabled:
+                    DrawEmbeddedDisabledActions(entry);
+                    break;
+            }
+        }
+
+        private void DrawPackageCacheActions(PackageOverrideEntry entry)
+        {
+            EditorGUILayout.BeginHorizontal();
+
+            if (GUILayout.Button("Embed to Packages/", GUILayout.Height(20)))
+            {
+                EmbedPackage(entry);
+            }
+
+            if (GUILayout.Button("Enable Override", GUILayout.Height(20)))
+            {
+                entry.isOverridden = true;
+                _hasUnsavedChanges = true;
+            }
+
+            EditorGUILayout.EndHorizontal();
+        }
+
+        private void DrawOverrideActiveActions(PackageOverrideEntry entry)
+        {
+            EditorGUILayout.BeginHorizontal();
+
+            if (GUILayout.Button("Disable Override", GUILayout.Height(20)))
+            {
+                entry.isOverridden = false;
+                _hasUnsavedChanges = true;
+            }
+
+            if (GUILayout.Button("Embed to Packages/", GUILayout.Height(20)))
+            {
+                EmbedPackage(entry);
+            }
+
+            EditorGUILayout.EndHorizontal();
+        }
+
+        private void DrawEmbeddedActiveActions(PackageOverrideEntry entry)
+        {
+            EditorGUILayout.BeginHorizontal();
+
+            if (GUILayout.Button("Disable Embedded", GUILayout.Height(20)))
+            {
+                DisableEmbeddedPackage(entry);
+            }
+
+            if (GUILayout.Button("Remove from Packages/", GUILayout.Height(20)))
+            {
+                RemoveEmbeddedPackage(entry);
+            }
+
+            EditorGUILayout.EndHorizontal();
+        }
+
+        private void DrawEmbeddedDisabledActions(PackageOverrideEntry entry)
+        {
+            EditorGUILayout.BeginHorizontal();
+            EditorGUILayout.LabelField("manifest.json version:", GUILayout.Width(140));
+            string newVersion = EditorGUILayout.TextField(entry.originalSource ?? "");
+            if (GUILayout.Button("Update", GUILayout.Width(60)))
+            {
+                UpdateManifestVersion(entry, newVersion);
+            }
+            EditorGUILayout.EndHorizontal();
+
+            EditorGUILayout.BeginHorizontal();
+
+            if (GUILayout.Button("Enable Embedded", GUILayout.Height(20)))
+            {
+                EnableEmbeddedPackage(entry);
+            }
+
+            if (GUILayout.Button("Remove from Packages/", GUILayout.Height(20)))
+            {
+                RemoveEmbeddedPackage(entry);
+            }
+
+            EditorGUILayout.EndHorizontal();
         }
 
         private void DrawFooter()
@@ -176,38 +330,55 @@ namespace PackageOverrider
             EditorGUILayout.Space();
         }
 
-        private void LoadManifest()
+        private void LoadPackageList()
         {
-            try
+            var listRequest = UnityEditor.PackageManager.Client.List(true, false);
+
+            while (!listRequest.IsCompleted)
             {
-                string content = File.ReadAllText(ManifestPath, Encoding.UTF8);
-                _currentDependencies = ParseDependencies(content);
+                System.Threading.Thread.Sleep(10);
             }
-            catch (Exception ex)
+
+            if (listRequest.Status == UnityEditor.PackageManager.StatusCode.Success)
             {
-                Debug.LogError($"Failed to load manifest.json: {ex.Message}");
-                _currentDependencies = null;
+                _packageInfoCache.Clear();
+                foreach (var packageInfo in listRequest.Result)
+                {
+                    _packageInfoCache[packageInfo.name] = packageInfo;
+                }
+
+                UpdateEntriesFromPackageInfo();
+            }
+            else
+            {
+                Debug.LogError($"Failed to load package list: {listRequest.Error?.message}");
             }
         }
 
-        private static Dictionary<string, string> ParseDependencies(string jsonContent)
+        private void UpdateEntriesFromPackageInfo()
         {
-            var result = new Dictionary<string, string>();
-
-            var dependenciesMatch = Regex.Match(jsonContent, @"""dependencies""\s*:\s*\{([^}]+)\}",
-                RegexOptions.Singleline);
-            if (!dependenciesMatch.Success)
-                return result;
-
-            var entryMatches = Regex.Matches(dependenciesMatch.Groups[1].Value,
-                @"""([^""]+)""\s*:\s*""([^""]+)""");
-
-            foreach (Match match in entryMatches)
+            foreach (var entry in _data.entries)
             {
-                result[match.Groups[1].Value] = match.Groups[2].Value;
-            }
+                if (_packageInfoCache.TryGetValue(entry.packageName, out var packageInfo))
+                {
+                    entry.isEmbedded = packageInfo.source == UnityEditor.PackageManager.PackageSource.Embedded;
 
-            return result;
+                    if (entry.isEmbedded)
+                    {
+                        string packageJsonPath = Path.Combine($"Packages/{entry.packageName}", "package.json");
+                        entry.isEmbeddedEnabled = File.Exists(packageJsonPath);
+                    }
+                    else
+                    {
+                        entry.isEmbeddedEnabled = false;
+                    }
+                }
+                else
+                {
+                    entry.isEmbedded = false;
+                    entry.isEmbeddedEnabled = false;
+                }
+            }
         }
 
         private void ApplyChanges()
@@ -215,11 +386,18 @@ namespace PackageOverrider
             try
             {
                 string content = File.ReadAllText(ManifestPath, Encoding.UTF8);
+                bool manifestModified = false;
 
                 foreach (var entry in _data.entries)
                 {
-                    if (!_currentDependencies.ContainsKey(entry.packageName))
+                    if (!_packageInfoCache.ContainsKey(entry.packageName))
                         continue;
+
+                    var state = GetPackageState(entry);
+                    if (state == PackageState.EmbeddedActive)
+                    {
+                        continue;
+                    }
 
                     string newSource;
                     if (entry.isOverridden && !string.IsNullOrEmpty(entry.overridePath))
@@ -237,15 +415,19 @@ namespace PackageOverrider
 
                     string pattern = $@"(""{Regex.Escape(entry.packageName)}""\s*:\s*"")[^""]+("")";
                     content = Regex.Replace(content, pattern, $"$1{EscapeJsonString(newSource)}$2");
+                    manifestModified = true;
                 }
 
-                File.WriteAllText(ManifestPath, content, Encoding.UTF8);
-                SaveSettings();
+                if (manifestModified)
+                {
+                    File.WriteAllText(ManifestPath, content, Encoding.UTF8);
+                }
 
+                SaveSettings();
                 UnityEditor.PackageManager.Client.Resolve();
 
                 _hasUnsavedChanges = false;
-                LoadManifest();
+                LoadPackageList();
 
                 Debug.Log("Package overrides applied successfully.");
             }
@@ -308,6 +490,178 @@ namespace PackageOverrider
             }
             return entry;
         }
+
+        private PackageState GetPackageState(PackageOverrideEntry entry)
+        {
+            if (entry.isEmbedded && entry.isEmbeddedEnabled)
+                return PackageState.EmbeddedActive;
+
+            if (entry.isEmbedded && !entry.isEmbeddedEnabled)
+                return PackageState.EmbeddedDisabled;
+
+            if (entry.isOverridden && !string.IsNullOrEmpty(entry.overridePath))
+                return PackageState.OverrideActive;
+
+            return PackageState.PackageCache;
+        }
+
+        private void ProcessAsyncRequest(UnityEditor.PackageManager.Requests.Request request, Action<UnityEditor.PackageManager.Requests.Request> onComplete)
+        {
+            _pendingRequests.Add((request, onComplete));
+        }
+
+        private void UpdatePendingRequests()
+        {
+            for (int i = _pendingRequests.Count - 1; i >= 0; i--)
+            {
+                var (request, onComplete) = _pendingRequests[i];
+
+                if (request.IsCompleted)
+                {
+                    if (request.Status == UnityEditor.PackageManager.StatusCode.Success)
+                    {
+                        onComplete?.Invoke(request);
+                    }
+                    else if (request.Status >= UnityEditor.PackageManager.StatusCode.Failure)
+                    {
+                        Debug.LogError($"Package Manager request failed: {request.Error.message}");
+                        EditorUtility.DisplayDialog("Error", $"パッケージ操作に失敗しました:\n{request.Error.message}", "OK");
+                    }
+
+                    _pendingRequests.RemoveAt(i);
+                    Repaint();
+                }
+            }
+        }
+
+        private void EmbedPackage(PackageOverrideEntry entry)
+        {
+            var state = GetPackageState(entry);
+            if (state == PackageState.EmbeddedActive || state == PackageState.EmbeddedDisabled)
+            {
+                EditorUtility.DisplayDialog("Warning", $"{entry.packageName} は既に Embedded package です。", "OK");
+                return;
+            }
+
+            var request = UnityEditor.PackageManager.Client.Embed(entry.packageName);
+            ProcessAsyncRequest(request, (req) =>
+            {
+                entry.isEmbedded = true;
+                entry.isEmbeddedEnabled = true;
+                _hasUnsavedChanges = true;
+                SaveSettings();
+                Debug.Log($"{entry.packageName} を Embedded package として Packages/ にコピーしました。");
+            });
+        }
+
+        private void RemoveEmbeddedPackage(PackageOverrideEntry entry)
+        {
+            if (!EditorUtility.DisplayDialog("Confirm Delete",
+                $"Packages/{entry.packageName} を削除しますか?\nこの操作は元に戻せません。",
+                "削除", "キャンセル"))
+            {
+                return;
+            }
+
+            var request = UnityEditor.PackageManager.Client.Remove(entry.packageName);
+            ProcessAsyncRequest(request, (req) =>
+            {
+                entry.isEmbedded = false;
+                entry.isEmbeddedEnabled = false;
+                _hasUnsavedChanges = true;
+                SaveSettings();
+                Debug.Log($"{entry.packageName} を削除しました。manifest.json の定義があれば再取得されます。");
+            });
+        }
+
+        private bool EnableEmbeddedPackage(PackageOverrideEntry entry)
+        {
+            string packageJsonPath = Path.Combine($"Packages/{entry.packageName}", "package.json");
+            string disabledPath = packageJsonPath + ".disabled";
+
+            if (!File.Exists(disabledPath))
+            {
+                EditorUtility.DisplayDialog("Error", "package.json.disabled が見つかりません。", "OK");
+                return false;
+            }
+
+            File.Move(disabledPath, packageJsonPath);
+            entry.isEmbeddedEnabled = true;
+            _hasUnsavedChanges = true;
+
+            AssetDatabase.Refresh();
+            UnityEditor.PackageManager.Client.Resolve();
+            Debug.Log($"{entry.packageName} の Embedded package を有効化しました。");
+            return true;
+        }
+
+        private bool DisableEmbeddedPackage(PackageOverrideEntry entry)
+        {
+            string packageJsonPath = Path.Combine($"Packages/{entry.packageName}", "package.json");
+            string disabledPath = packageJsonPath + ".disabled";
+
+            if (!File.Exists(packageJsonPath))
+            {
+                EditorUtility.DisplayDialog("Error", "package.json が見つかりません。", "OK");
+                return false;
+            }
+
+            File.Move(packageJsonPath, disabledPath);
+            entry.isEmbeddedEnabled = false;
+            _hasUnsavedChanges = true;
+
+            AssetDatabase.Refresh();
+            UnityEditor.PackageManager.Client.Resolve();
+            Debug.Log($"{entry.packageName} の Embedded package を無効化しました。manifest.json の定義が有効になります。");
+            return true;
+        }
+
+
+        private void UpdateManifestVersion(PackageOverrideEntry entry, string newVersion)
+        {
+            if (string.IsNullOrWhiteSpace(newVersion))
+            {
+                EditorUtility.DisplayDialog("Error", "バージョンを入力してください。", "OK");
+                return;
+            }
+
+            try
+            {
+                string content = File.ReadAllText(ManifestPath, Encoding.UTF8);
+                string pattern = $@"(""{Regex.Escape(entry.packageName)}""\s*:\s*"")[^""]+("")";
+                string replacement = $"$1{EscapeJsonString(newVersion)}$2";
+
+                string newContent = Regex.Replace(content, pattern, replacement);
+
+                if (newContent == content)
+                {
+                    EditorUtility.DisplayDialog("Warning", $"{entry.packageName} が manifest.json に見つかりませんでした。", "OK");
+                    return;
+                }
+
+                File.WriteAllText(ManifestPath, newContent, Encoding.UTF8);
+                entry.originalSource = newVersion;
+                SaveSettings();
+
+                UnityEditor.PackageManager.Client.Resolve();
+                LoadPackageList();
+
+                Debug.Log($"{entry.packageName} のバージョンを {newVersion} に変更しました。");
+            }
+            catch (Exception ex)
+            {
+                Debug.LogError($"Failed to update manifest version: {ex.Message}");
+                EditorUtility.DisplayDialog("Error", $"バージョンの変更に失敗しました:\n{ex.Message}", "OK");
+            }
+        }
+    }
+
+    internal enum PackageState
+    {
+        PackageCache,
+        OverrideActive,
+        EmbeddedActive,
+        EmbeddedDisabled
     }
 
     [Serializable]
@@ -317,6 +671,8 @@ namespace PackageOverrider
         public string originalSource;
         public string overridePath;
         public bool isOverridden;
+        public bool isEmbedded;
+        public bool isEmbeddedEnabled;
     }
 
     [Serializable]
