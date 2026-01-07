@@ -1,0 +1,9 @@
+{
+  "name": "jp.amamagi.package-incrementer",
+  "version": "0.1.0",
+  "displayName": "Package Incrementer",
+  "author": {
+    "name": "amamagi"
+  },
+  "description": "Increment semantic versions of embedded Unity packages."
+}

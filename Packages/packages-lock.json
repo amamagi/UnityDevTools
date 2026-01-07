@@ -193,6 +193,12 @@
       },
       "url": "https://packages.unity.com"
     },
+    "jp.amamagi.package-incrementer": {
+      "version": "file:PackageIncrementer",
+      "depth": 0,
+      "source": "embedded",
+      "dependencies": {}
+    },
     "jp.amamagi.package-overrider": {
       "version": "file:PackageOverrider",
       "depth": 0,
